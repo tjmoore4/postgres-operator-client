@@ -16,13 +16,17 @@ package cmd
 
 import (
 	"context"
+	"encoding/base64"
 	"fmt"
 	"io"
+	"os"
+	"sort"
 	"strings"
 
 	"github.com/spf13/cobra"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	corev1 "k8s.io/client-go/kubernetes/typed/core/v1"
+	"sigs.k8s.io/yaml"
 
 	"github.com/crunchydata/postgres-operator-client/internal"
 	"github.com/crunchydata/postgres-operator-client/internal/util"
@@ -77,6 +81,7 @@ HA
 	cmdShow.AddCommand(
 		newShowBackupCommand(config),
 		newShowHACommand(config),
+		newShowUserCommand(config),
 	)
 
 	// Limit the number of args, that is, only one cluster name
@@ -276,6 +281,143 @@ func showHA(
 	}
 
 	return Executor(exec).patronictl("list", output)
+}
+
+// newShowUserCommand returns the decoded contents of the cluster's user Secrets.
+func newShowUserCommand(config *internal.Config) *cobra.Command {
+
+	cmdShowUser := &cobra.Command{
+		Use:   "user CLUSTER_NAME",
+		Short: "Show pguser Secret details for a PostgresCluster.",
+		Long: `Show pguser Secret details for a PostgresCluster.
+
+#### RBAC Requirements
+    Resources  Verbs
+    ---------  -----
+    secrets       [list]
+
+### Usage`}
+
+	cmdShowUser.Example = internal.FormatExample(`# Show non-sensitive contents of 'pguser' Secret
+pgo show user hippo
+
+# Show contents of 'pguser' Secret, including sensitive fields
+pgo show user hippo --show-sensitive-fields
+
+### Example output
+pgo show user hippo
+SECRET: hippo-pguser-hippo
+  DBNAME: hippo
+  HOST: hippo-primary.postgres-operator.svc
+  PORT: 5432
+  USER: hippo
+	`)
+
+	var fields bool
+	cmdShowUser.Flags().BoolVarP(&fields, "show-sensitive-fields", "f", false, "show sensitive user fields")
+
+	// Limit the number of args, that is, only one cluster name
+	cmdShowUser.Args = cobra.ExactArgs(1)
+
+	// Define the 'show backup' command
+	cmdShowUser.RunE = func(cmd *cobra.Command, args []string) error {
+
+		stdout, err := showUser(config, args, fields)
+		if err != nil {
+			return err
+		}
+
+		cmd.Print(stdout)
+
+		return nil
+	}
+
+	return cmdShowUser
+}
+
+// showUser returns a string with the decoded contents of the cluster's user Secrets.
+func showUser(config *internal.Config, args []string, showSensitive bool) (string, error) {
+
+	var output string
+
+	// break out keys based on whether sensitive information is included
+	var fields = []string{"dbname", "host", "pgbouncer-host", "pgbouncer-port", "port", "user"}
+	var sensitive = []string{"jdbc-uri", "password", "pgbouncer-jdbc-uri", "pgbouncer-uri", "uri", "verifier"}
+
+	if showSensitive {
+		fields = append(fields, sensitive...)
+
+		fmt.Print("WARNING: This command will show sensitive password information." +
+			"\nAre you sure you want to continue? (yes/no): ")
+
+		var confirmed *bool
+		for i := 0; confirmed == nil && i < 10; i++ {
+			// retry 10 times or until a confirmation is given or denied,
+			// whichever comes first
+			confirmed = confirm(os.Stdin, os.Stdout)
+		}
+
+		if confirmed == nil || !*confirmed {
+			return "", nil
+		}
+	}
+
+	// configure client
+	ctx := context.Background()
+	rest, err := config.ToRESTConfig()
+	if err != nil {
+		return output, err
+	}
+	client, err := corev1.NewForConfig(rest)
+	if err != nil {
+		return output, err
+	}
+
+	// Get the namespace. This will either be from the Kubernetes configuration
+	// or from the --namespace (-n) flag.
+	configNamespace, err := config.Namespace()
+	if err != nil {
+		return output, err
+	}
+
+	list, err := client.Secrets(configNamespace).List(ctx, metav1.ListOptions{
+		LabelSelector: util.PostgresUserSecretLabels(args[0]),
+	})
+	if err != nil {
+		return output, err
+	}
+
+	if len(list.Items) == 0 {
+		output += fmt.Sprintln("No user Secrets found.")
+	}
+
+	for _, secret := range list.Items {
+		output += fmt.Sprintf("SECRET: %s\n", secret.Name)
+
+		// sort keys
+		keys := make([]string, 0, len(secret.Data))
+		for k := range secret.Data {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		// decode and print keys and values from Secret
+		for _, k := range keys {
+			b, err := yaml.Marshal(secret.Data[k])
+			if err != nil {
+				return output, err
+			}
+			d := make([]byte, base64.StdEncoding.EncodedLen(len(b)))
+			_, err = base64.StdEncoding.Decode(d, b)
+			if err != nil {
+				return output, err
+			}
+			if containsString(fields, k) {
+				output += fmt.Sprintf("  %s: %s\n", strings.ToUpper(k), string(d))
+			}
+		}
+	}
+	return output, err
 }
 
 // getPrimaryExec returns a executor function for the primary Pod to allow for
